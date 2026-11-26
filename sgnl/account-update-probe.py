@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """Checks the fork's account update rule against a running Stalwart (a throwaway copy, never production).
 
-Usage: account-update-probe.py BASE_URL < admin-credentials
+Usage: [AUTH=password|impersonate] account-update-probe.py BASE_URL < admin-credentials
        (stdin, first line: an administrator's "user:password", e.g. the recovery admin)
+
+AUTH=password (default, for an empty server): the test accounts get passwords and probe logs in with its
+own. AUTH=impersonate (for a server whose domains use an external directory such as OIDC, where passwords
+can't be set): the accounts get no credentials, and probe's calls log in as "probe@domain%<admin user>"
+with the administrator's password. The recovery admin's impersonation yields the impersonated account's
+own access token (crates/common/src/auth/authentication.rs, authenticate_basic: `self.access_token(account_id)`
+for the impersonated account), so the calls run with probe's permissions, not the administrator's.
 
 As the administrator it creates its own accounts: two groups, a user, and "probe", a user whose
 permissions are replaced with authenticate, sysAccountGet, sysAccountQuery and sysAccountUpdate (like an
@@ -14,6 +21,7 @@ Python 3 standard library only.
 """
 
 import base64
+import os
 import json
 import secrets
 import sys
@@ -83,6 +91,10 @@ def main():
     admin_user, _, admin_password = sys.stdin.readline().rstrip("\n").partition(":")
     if not admin_password:
         raise SystemExit("stdin: expected user:password on the first line")
+    auth = os.environ.get("AUTH", "password")
+    if auth not in ("password", "impersonate"):
+        raise SystemExit("AUTH must be password or impersonate")
+    impersonate = auth == "impersonate"
     admin = Client(base, admin_user, admin_password)
 
     domains = admin.call("x:Domain/query", {}).get("ids", [])
@@ -102,14 +114,14 @@ def main():
     user_password = password()
     user = admin.create("Account", {
         "@type": "User", "name": f"probe-user-{tag}", "domainId": domain_id,
-        "credentials": {"0": {"@type": "Password", "secret": user_password}},
+        **({} if impersonate else {"credentials": {"0": {"@type": "Password", "secret": user_password}}}),
     })
     accounts.append(user)
     probe_name = f"probe-{tag}"
     probe_password = password()
     probe = admin.create("Account", {
         "@type": "User", "name": probe_name, "domainId": domain_id,
-        "credentials": {"0": {"@type": "Password", "secret": probe_password}},
+        **({} if impersonate else {"credentials": {"0": {"@type": "Password", "secret": probe_password}}}),
         "permissions": {"@type": "Replace", "disabledPermissions": {}, "enabledPermissions": {
             "authenticate": True, "sysAccountGet": True, "sysAccountQuery": True, "sysAccountUpdate": True}},
     })
@@ -126,7 +138,13 @@ def main():
         print(f"{'PASS' if ok else 'FAIL'}  {name}: expected {expected}, {got}")
 
     try:
-        as_probe = Client(base, f"{probe_name}@{domain_name}", probe_password)
+        if impersonate:
+            as_probe = Client(base, f"{probe_name}@{domain_name}%{admin_user}", admin_password)
+        else:
+            as_probe = Client(base, f"{probe_name}@{domain_name}", probe_password)
+        print(f"auth: {auth}; probe acts as account {as_probe.account}, the administrator as {admin.account}")
+        if as_probe.account == admin.account:
+            raise SystemExit("probe's calls run as the administrator: the test would prove nothing")
 
         before = admin.get("Account", user)
         alias = {"0": {"enable": True, "name": f"probe-alias-{tag}", "domainId": domain_id}}
@@ -168,12 +186,13 @@ def main():
         unchanged = all(after.get(p) == before.get(p) for p in ("credentials", "permissions", "roles", "description"))
         case("user: the allowed changes were stored, nothing else changed", None if kept and unchanged else
              f"stored groups/aliases/quota {kept}, other fields unchanged {unchanged}", True)
-        login = True
-        try:
-            Client(base, f"probe-user-{tag}@{domain_name}", user_password)
-        except SystemExit:
-            login = False
-        case("user: the old password still works", None if login else "login failed", True)
+        if not impersonate:
+            login = True
+            try:
+                Client(base, f"probe-user-{tag}@{domain_name}", user_password)
+            except SystemExit:
+                login = False
+            case("user: the old password still works", None if login else "login failed", True)
     finally:
         admin.destroy("Account", list(reversed(accounts)))
         if created_domain:
