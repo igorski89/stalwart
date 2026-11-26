@@ -217,6 +217,9 @@ def main():
                 and stored.get("roles", {}).get("@type") == "Default" and not stored.get("aliases")
             case("group: created with inherited permissions, default roles, no aliases",
                  None if plain else "stored differently", True)
+        create("group: create at an address in use (the test user's)", {
+            "@type": "Group", "name": f"probe-user-{tag}", "domainId": domain_id}, False,
+            refused_with=("primaryKeyViolation",))
         create("group: create with permissions", {
             "@type": "Group", "name": f"probe-g1-{tag}", "domainId": domain_id,
             "permissions": {"@type": "Merge", "disabledPermissions": {}, "enabledPermissions": {}}}, False)
@@ -231,6 +234,31 @@ def main():
             "aliases": {"0": {"enable": True, "name": f"probe-g3-alias-{tag}", "domainId": domain_id}}}, False)
         create("user: create with the default role", {
             "@type": "User", "name": f"probe-u1-{tag}", "domainId": domain_id}, False)
+
+        # Not a case (upstream's rule, unchanged): a user whose permissions are a subset of probe's may be
+        # created by probe. Whether it can get a password depends on the server's directory.
+        info_user, error = as_probe.try_create("Account", {
+            "@type": "User", "name": f"probe-u2-{tag}", "domainId": domain_id,
+            "permissions": {"@type": "Replace", "disabledPermissions": {}, "enabledPermissions": {"authenticate": True}}})
+        if info_user:
+            accounts.append(info_user)
+        print(f"INFO  user with permissions Replace{{authenticate}}, no credentials: "
+              f"{'created' if info_user else f'refused ({error})'}")
+        info_password = password()
+        info_user, error = as_probe.try_create("Account", {
+            "@type": "User", "name": f"probe-u3-{tag}", "domainId": domain_id,
+            "credentials": {"0": {"@type": "Password", "secret": info_password}},
+            "permissions": {"@type": "Replace", "disabledPermissions": {}, "enabledPermissions": {"authenticate": True}}})
+        if info_user:
+            accounts.append(info_user)
+            try:
+                Client(base, f"probe-u3-{tag}@{domain_name}", info_password)
+                login = "its password login works"
+            except SystemExit as err:
+                login = f"its password login fails ({err})"
+            print(f"INFO  user with permissions Replace{{authenticate}} and a password: created, {login}")
+        else:
+            print(f"INFO  user with permissions Replace{{authenticate}} and a password: refused ({error})")
 
         # What the server kept.
         after = admin.get("Account", user)
