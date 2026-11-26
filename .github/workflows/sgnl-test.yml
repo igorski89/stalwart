@@ -1,4 +1,5 @@
-# SGNL fork: unit tests of the fork's change. No image is built or published
+# SGNL fork: unit tests of the fork's change, and the probe against a debug
+# build of the server (sgnl/account-update-probe.py). No image is built or published
 # here and no binary is uploaded; the image is built privately (see FORK.md).
 name: 'SGNL test'
 
@@ -31,3 +32,39 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
       - name: 'Test'
         run: cargo test -p jmap --features enterprise --lib registry::mapping::principal
+
+  probe:
+    name: 'Probe the account update rule on a running server'
+    runs-on: 'ubuntu-latest'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: 'Free disk space'
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+      - name: 'Build dependencies'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -yq --no-install-recommends libclang-dev
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+      # A debug build, kept on the runner: never uploaded.
+      - name: 'Build the server'
+        run: cargo build -p stalwart --no-default-features --features 'rocks enterprise'
+      - name: 'Start an empty server'
+        run: |
+          sudo setcap 'cap_net_bind_service=+ep' target/debug/stalwart
+          mkdir -p "${RUNNER_TEMP}/data"
+          printf '{"@type":"RocksDb","path":"%s/data/"}' "${RUNNER_TEMP}" > "${RUNNER_TEMP}/config.json"
+          password="$(openssl rand -hex 24)"
+          echo "::add-mask::${password}"
+          printf 'admin:%s\n' "${password}" > "${RUNNER_TEMP}/admin"
+          STALWART_RECOVERY_ADMIN="admin:${password}" nohup target/debug/stalwart --config "${RUNNER_TEMP}/config.json" > "${RUNNER_TEMP}/server.log" 2>&1 &
+          for i in $(seq 1 60); do curl -sf -o /dev/null http://127.0.0.1:8080/healthz/ready && exit 0; sleep 2; done
+          tail -50 "${RUNNER_TEMP}/server.log"; exit 1
+      - name: 'Probe (password)'
+        run: python3 -I sgnl/account-update-probe.py http://127.0.0.1:8080 < "${RUNNER_TEMP}/admin"
+      - name: 'Probe (impersonation)'
+        run: AUTH=impersonate python3 -I sgnl/account-update-probe.py http://127.0.0.1:8080 < "${RUNNER_TEMP}/admin"
+      - name: 'Server log'
+        if: failure()
+        run: tail -100 "${RUNNER_TEMP}/server.log"

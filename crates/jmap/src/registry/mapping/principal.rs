@@ -80,8 +80,8 @@ pub async fn validate_account(
         None
     };
 
-    // Changing only group memberships, aliases or quotas doesn't require holding
-    // every permission of the account being updated (see `is_directory_update`).
+    // Changing only group memberships or quotas doesn't require holding every
+    // permission of the account being updated (see `is_directory_update`).
     if let AccountUpdate::Update(old_account) = old_account
         && !is_directory_update(account, old_account)
         && let Err(err) = validate_account_access(server, access_token, old_account).await?
@@ -297,10 +297,12 @@ pub async fn validate_account_access(
         .map(|result| result.map_err(build_set_error))
 }
 
-/// Whether an update changes nothing but the group memberships, aliases or
-/// quotas of a user, or the quotas of a group. Such an update can't change what
-/// the account is allowed to do: memberships only give access to the groups'
-/// own data, and must name existing groups. Any other change, to credentials,
+/// Whether an update changes nothing but the group memberships or quotas of a
+/// user, or the quotas of a group. Such an update can't change the account's
+/// permissions or roles: group IDs must name existing groups, and membership
+/// gives access to the groups' data and to whatever is shared with the groups,
+/// not to their permissions or roles. Any other change, to aliases (logins
+/// through an external directory resolve addresses by alias), credentials,
 /// roles, permissions, name, domain or anything else, still requires the caller
 /// to hold every permission of the account.
 pub fn is_directory_update(account: &Account, old_account: &Account) -> bool {
@@ -308,7 +310,6 @@ pub fn is_directory_update(account: &Account, old_account: &Account) -> bool {
         (Account::User(account), Account::User(old_account)) => {
             let mut account = account.clone();
             account.member_group_ids = old_account.member_group_ids.clone();
-            account.aliases = old_account.aliases.clone();
             account.quotas = old_account.quotas.clone();
             account == *old_account
         }
@@ -672,8 +673,19 @@ mod tests {
             |u| u.member_group_ids = Map::new(vec![Id::from(10u64), Id::from(11u64)])
         ));
         assert!(check_user(|u| u.member_group_ids = Map::new(vec![])));
-        assert!(check_user(|u| u.aliases = List::from(vec![])));
         assert!(check_user(|u| {
+            u.quotas.set(StorageQuota::MaxDiskQuota, 0);
+        }));
+        assert!(check_user(|u| {
+            u.member_group_ids = Map::new(vec![]);
+            u.quotas.set(StorageQuota::MaxEmails, 5);
+        }));
+    }
+
+    #[test]
+    fn other_changes_of_a_user_need_the_full_check() {
+        // Aliases
+        assert!(!check_user(|u| {
             u.aliases.0.append(
                 1u32,
                 EmailAlias {
@@ -684,18 +696,7 @@ mod tests {
                 },
             )
         }));
-        assert!(check_user(|u| {
-            u.quotas.set(StorageQuota::MaxDiskQuota, 0);
-        }));
-        assert!(check_user(|u| {
-            u.member_group_ids = Map::new(vec![]);
-            u.aliases = List::from(vec![]);
-            u.quotas.set(StorageQuota::MaxEmails, 5);
-        }));
-    }
-
-    #[test]
-    fn other_changes_of_a_user_need_the_full_check() {
+        assert!(!check_user(|u| u.aliases = List::from(vec![])));
         // Credentials
         assert!(!check_user(|u| {
             if let Some(Credential::Password(p)) =

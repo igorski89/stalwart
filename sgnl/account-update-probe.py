@@ -14,8 +14,9 @@ for the impersonated account), so the calls run with probe's permissions, not th
 As the administrator it creates its own accounts: two groups, a user, and "probe", a user whose
 permissions are replaced with authenticate, sysAccountGet, sysAccountQuery and sysAccountUpdate (like an
 automated directory client). As probe it then updates the user and a group. The fork allows changes of
-memberGroupIds, aliases and quotas only; upstream refuses all of them, because probe doesn't hold every
-permission of the user. At the end it reads the accounts back as the administrator and destroys what it
+memberGroupIds and quotas only; upstream refuses all of them, because probe doesn't hold every
+permission of the user. Aliases stay refused: logins through an external directory resolve addresses by
+alias. At the end it reads the accounts back as the administrator and destroys what it
 created. Prints one line per case (PASS/FAIL), never a credential. Exit code 0 when every case passes.
 Python 3 standard library only.
 """
@@ -156,11 +157,13 @@ def main():
              as_probe.update("Account", user, {"memberGroupIds": {group_b: True}}), True)
         case("user: remove from all groups (memberGroupIds)",
              as_probe.update("Account", user, {"memberGroupIds": {}}), True)
-        case("user: add an alias", as_probe.update("Account", user, {"aliases": alias}), True)
         case("user: set a disk quota", as_probe.update("Account", user, {"quotas": {"maxDiskQuota": 1 << 30}}), True)
         case("group: set a disk quota", as_probe.update("Account", group_a, {"quotas": {"maxDiskQuota": 1 << 30}}), True)
 
         # Still refused.
+        case("user: add an alias", as_probe.update("Account", user, {"aliases": alias}), False)
+        case("user: group change together with an alias", as_probe.update("Account", user, {
+            "memberGroupIds": {group_a: True}, "aliases": alias}), False)
         case("user: change the password", as_probe.update("Account", user, {
             "credentials": {"0": {"@type": "Password", "secret": password()}}}), False)
         case("user: change permissions", as_probe.update("Account", user, {
@@ -181,11 +184,12 @@ def main():
 
         # What the server kept.
         after = admin.get("Account", user)
-        kept = (after.get("memberGroupIds") or {}) == {} and bool(after.get("aliases")) \
+        kept = (after.get("memberGroupIds") or {}) == {} \
             and (after.get("quotas") or {}).get("maxDiskQuota") == 1 << 30
-        unchanged = all(after.get(p) == before.get(p) for p in ("credentials", "permissions", "roles", "description"))
+        unchanged = all(after.get(p) == before.get(p)
+                        for p in ("aliases", "credentials", "permissions", "roles", "description"))
         case("user: the allowed changes were stored, nothing else changed", None if kept and unchanged else
-             f"stored groups/aliases/quota {kept}, other fields unchanged {unchanged}", True)
+             f"stored groups/quota {kept}, other fields unchanged {unchanged}", True)
         if not impersonate:
             login = True
             try:
