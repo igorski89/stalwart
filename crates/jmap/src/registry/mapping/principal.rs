@@ -80,7 +80,10 @@ pub async fn validate_account(
         None
     };
 
+    // Changing only group memberships, aliases or quotas doesn't require holding
+    // every permission of the account being updated (see `is_directory_update`).
     if let AccountUpdate::Update(old_account) = old_account
+        && !is_directory_update(account, old_account)
         && let Err(err) = validate_account_access(server, access_token, old_account).await?
     {
         return Ok(Err(err));
@@ -292,6 +295,30 @@ pub async fn validate_account_access(
         .can_set_permissions(access_token, account)
         .await
         .map(|result| result.map_err(build_set_error))
+}
+
+/// Whether an update changes nothing but the group memberships, aliases or
+/// quotas of a user, or the quotas of a group. Such an update can't change what
+/// the account is allowed to do: memberships only give access to the groups'
+/// own data, and must name existing groups. Any other change, to credentials,
+/// roles, permissions, name, domain or anything else, still requires the caller
+/// to hold every permission of the account.
+pub fn is_directory_update(account: &Account, old_account: &Account) -> bool {
+    match (account, old_account) {
+        (Account::User(account), Account::User(old_account)) => {
+            let mut account = account.clone();
+            account.member_group_ids = old_account.member_group_ids.clone();
+            account.aliases = old_account.aliases.clone();
+            account.quotas = old_account.quotas.clone();
+            account == *old_account
+        }
+        (Account::Group(account), Account::Group(old_account)) => {
+            let mut account = account.clone();
+            account.quotas = old_account.quotas.clone();
+            account == *old_account
+        }
+        _ => false,
+    }
 }
 
 async fn validate_credential_creation(
@@ -567,4 +594,162 @@ async fn restore_account_id(server: &Server, id: u32) -> trc::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_directory_update;
+    use registry::{
+        schema::{
+            enums::{Permission, StorageQuota},
+            structs::{
+                Account, Credential, CustomRoles, EmailAlias, GroupAccount, PasswordCredential,
+                Permissions, PermissionsList, Roles, UserAccount, UserRoles,
+            },
+        },
+        types::{list::List, map::Map},
+    };
+    use types::id::Id;
+
+    fn user() -> UserAccount {
+        let mut user = UserAccount {
+            name: "jane".into(),
+            domain_id: Id::from(1u64),
+            credentials: List::from(vec![Credential::Password(PasswordCredential {
+                credential_id: Id::from(0u64),
+                secret: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".into(),
+                ..Default::default()
+            })]),
+            member_group_ids: Map::new(vec![Id::from(10u64)]),
+            aliases: List::from(vec![EmailAlias {
+                enable: true,
+                name: "j".into(),
+                domain_id: Id::from(1u64),
+                description: None,
+            }]),
+            roles: UserRoles::Admin,
+            ..Default::default()
+        };
+        user.quotas.set(StorageQuota::MaxDiskQuota, 1 << 30);
+        user
+    }
+
+    fn group() -> GroupAccount {
+        let mut group = GroupAccount {
+            name: "staff".into(),
+            domain_id: Id::from(1u64),
+            ..Default::default()
+        };
+        group.quotas.set(StorageQuota::MaxDiskQuota, 1 << 30);
+        group
+    }
+
+    fn check_user(change: impl FnOnce(&mut UserAccount)) -> bool {
+        let old = Account::User(user());
+        let mut new = user();
+        change(&mut new);
+        is_directory_update(&Account::User(new), &old)
+    }
+
+    fn check_group(change: impl FnOnce(&mut GroupAccount)) -> bool {
+        let old = Account::Group(group());
+        let mut new = group();
+        change(&mut new);
+        is_directory_update(&Account::Group(new), &old)
+    }
+
+    fn permissions() -> Permissions {
+        Permissions::Merge(PermissionsList {
+            enabled_permissions: Map::new(vec![Permission::Impersonate]),
+            disabled_permissions: Map::new(vec![]),
+        })
+    }
+
+    #[test]
+    fn directory_changes_of_a_user_are_exempt() {
+        assert!(check_user(|_| {}));
+        assert!(check_user(
+            |u| u.member_group_ids = Map::new(vec![Id::from(10u64), Id::from(11u64)])
+        ));
+        assert!(check_user(|u| u.member_group_ids = Map::new(vec![])));
+        assert!(check_user(|u| u.aliases = List::from(vec![])));
+        assert!(check_user(|u| {
+            u.aliases.0.append(
+                1u32,
+                EmailAlias {
+                    enable: true,
+                    name: "jane.doe".into(),
+                    domain_id: Id::from(1u64),
+                    description: None,
+                },
+            )
+        }));
+        assert!(check_user(|u| {
+            u.quotas.set(StorageQuota::MaxDiskQuota, 0);
+        }));
+        assert!(check_user(|u| {
+            u.member_group_ids = Map::new(vec![]);
+            u.aliases = List::from(vec![]);
+            u.quotas.set(StorageQuota::MaxEmails, 5);
+        }));
+    }
+
+    #[test]
+    fn other_changes_of_a_user_need_the_full_check() {
+        // Credentials
+        assert!(!check_user(|u| {
+            if let Some(Credential::Password(p)) =
+                u.credentials.0.inner.first_mut().map(|kv| &mut kv.value)
+            {
+                p.secret = "new password".into();
+            }
+        }));
+        assert!(!check_user(|u| u.credentials = List::from(vec![])));
+        // Roles and permissions
+        assert!(!check_user(|u| u.roles = UserRoles::User));
+        assert!(!check_user(|u| u.roles = UserRoles::Custom(CustomRoles {
+            role_ids: Map::new(vec![Id::from(3u64)])
+        })));
+        assert!(!check_user(|u| u.permissions = permissions()));
+        // Identity
+        assert!(!check_user(|u| u.name = "john".into()));
+        assert!(!check_user(|u| u.domain_id = Id::from(2u64)));
+        assert!(!check_user(|u| u.description = Some("x".into())));
+        // An allowed change together with another one
+        assert!(!check_user(|u| {
+            u.member_group_ids = Map::new(vec![]);
+            u.roles = UserRoles::User;
+        }));
+    }
+
+    #[test]
+    fn only_quotas_of_a_group_are_exempt() {
+        assert!(check_group(|_| {}));
+        assert!(check_group(|g| {
+            g.quotas.set(StorageQuota::MaxDiskQuota, 0);
+        }));
+        assert!(!check_group(|g| g.aliases = List::from(vec![EmailAlias {
+            enable: true,
+            name: "staff".into(),
+            domain_id: Id::from(1u64),
+            description: None,
+        }])));
+        assert!(!check_group(|g| g.permissions = permissions()));
+        assert!(!check_group(|g| g.roles = Roles::Custom(CustomRoles {
+            role_ids: Map::new(vec![Id::from(3u64)])
+        })));
+        assert!(!check_group(|g| g.name = "admins".into()));
+    }
+
+    #[test]
+    fn the_account_type_cannot_change() {
+        assert!(!is_directory_update(
+            &Account::Group(group()),
+            &Account::User(user())
+        ));
+        assert!(!is_directory_update(
+            &Account::User(user()),
+            &Account::Group(group())
+        ));
+    }
 }

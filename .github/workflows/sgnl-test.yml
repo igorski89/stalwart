@@ -1,0 +1,33 @@
+# SGNL fork: unit tests of the fork's change. No image is built or published
+# here and no binary is uploaded; the image is built privately (see FORK.md).
+name: 'SGNL test'
+
+on:
+  push:
+    branches:
+      - 'sgnl'
+    tags:
+      - 'v*-sgnl.*'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: 'read'
+
+jobs:
+  test:
+    name: 'Unit tests (account update rule)'
+    runs-on: 'ubuntu-latest'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: 'Free disk space'
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+      - name: 'Build dependencies'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -yq --no-install-recommends libclang-dev
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
+      - name: 'Test'
+        run: cargo test -p jmap --features enterprise --lib registry::mapping::principal
