@@ -21,6 +21,7 @@ endorsed by Stalwart Labs.** For Stalwart itself, use upstream; don't report pro
 
 | Tag | Commit | Notes |
 |---|---|---|
+| `v1.1.1-sgnl.2` | `82517c21` | Creating groups with the defaults (see below). Security review; probe passed on an empty server and on a restored copy of production data (the probe's own later additions are in `374191be`); in production since 2026-11-26 |
 | `v1.1.1-sgnl.1` | `106776e8` | Account updates that only change group memberships or quotas. Security review, then a delta review after aliases were removed from the exemption; probe passed on an empty server and on a restored copy of production data; in production since 2026-11-26 |
 
 ## Changes from upstream
