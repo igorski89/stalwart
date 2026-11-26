@@ -130,9 +130,13 @@ def main():
 
     failures = 0
 
-    def case(name, error, expect_allowed):
+    def case(name, error, expect_allowed, refused_with=("forbidden",)):
+        """A refused case passes only with one of the expected error types."""
         nonlocal failures
-        ok = (error is None) == expect_allowed
+        if expect_allowed:
+            ok = error is None
+        else:
+            ok = error is not None and error.split(":", 1)[0] in refused_with
         failures += not ok
         expected = "allowed" if expect_allowed else "refused"
         got = "allowed" if error is None else f"refused ({error})"
@@ -175,7 +179,8 @@ def main():
         case("user: group change together with a description change", as_probe.update("Account", user, {
             "memberGroupIds": {group_a: True}, "description": "changed by probe"}), False)
         case("user: a user as a group (memberGroupIds)",
-             as_probe.update("Account", user, {"memberGroupIds": {probe: True}}), False)
+             as_probe.update("Account", user, {"memberGroupIds": {probe: True}}), False,
+             refused_with=("invalidForeignKey",))
         case("group: add an alias", as_probe.update("Account", group_a, {"aliases": {
             "0": {"enable": True, "name": f"probe-group-alias-{tag}", "domainId": domain_id}}}), False)
         case("group: change permissions", as_probe.update("Account", group_a, {
