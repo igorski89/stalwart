@@ -16,7 +16,10 @@ use registry::{
     schema::{
         enums::{AccountType, Permission},
         prelude::{MASKED_PASSWORD, ObjectType, Property},
-        structs::{Account, Credential, Role, Task, TaskDestroyAccount},
+        structs::{
+            Account, Credential, GroupAccount, Permissions as AccountPermissions, Role, Roles,
+            Task, TaskDestroyAccount,
+        },
     },
     types::EnumImpl,
 };
@@ -255,7 +258,10 @@ pub async fn validate_account(
 
             true
         }
-        (Account::Group(_), AccountUpdate::Create(_)) => true,
+        // A group created with the defaults (inherited permissions, default
+        // roles, no aliases, no tenant or external ID) gets nothing that every
+        // other such group doesn't have (see `is_plain_group`).
+        (Account::Group(account), AccountUpdate::Create(_)) => !is_plain_group(account),
         (Account::User(_), AccountUpdate::Update(Account::Group(_)))
         | (Account::Group(_), AccountUpdate::Update(Account::User(_))) => {
             return Ok(Err(SetError::invalid_properties()
@@ -320,6 +326,24 @@ pub fn is_directory_update(account: &Account, old_account: &Account) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether a new group has the default permissions and roles, no aliases and,
+/// in the enterprise edition, no tenant and no external ID. Creating such a
+/// group doesn't require holding the permissions of the default group roles:
+/// a group has no credentials and can't log in (a login through an external
+/// directory that resolves to a group is refused), and membership gives the
+/// group's data and whatever is shared with it, not its permissions or roles.
+/// Its name, domain, description, quotas, locale and time zone are free.
+pub fn is_plain_group(group: &GroupAccount) -> bool {
+    #[cfg(feature = "enterprise")]
+    if group.member_tenant_id.is_some() || group.external_id.is_some() {
+        return false;
+    }
+
+    matches!(group.permissions, AccountPermissions::Inherit)
+        && matches!(group.roles, Roles::Default)
+        && group.aliases.is_empty()
 }
 
 async fn validate_credential_creation(
@@ -599,7 +623,7 @@ async fn restore_account_id(server: &Server, id: u32) -> trc::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::is_directory_update;
+    use super::{is_directory_update, is_plain_group};
     use registry::{
         schema::{
             enums::{Permission, StorageQuota},
@@ -752,5 +776,53 @@ mod tests {
             &Account::User(user()),
             &Account::Group(group())
         ));
+    }
+
+    #[test]
+    fn plain_groups_can_be_created_without_the_group_roles() {
+        let plain = || GroupAccount {
+            name: "sales".into(),
+            domain_id: Id::from(1u64),
+            ..Default::default()
+        };
+        assert!(is_plain_group(&plain()));
+        // Free: description, quotas, locale and time zone.
+        let mut group = plain();
+        group.description = Some("Sales team".into());
+        group.quotas.set(StorageQuota::MaxDiskQuota, 1 << 30);
+        assert!(is_plain_group(&group));
+
+        // Anything else needs the full check.
+        let mut group = plain();
+        group.permissions = permissions();
+        assert!(!is_plain_group(&group));
+        let mut group = plain();
+        group.permissions = Permissions::Replace(PermissionsList {
+            enabled_permissions: Map::new(vec![]),
+            disabled_permissions: Map::new(vec![]),
+        });
+        assert!(!is_plain_group(&group));
+        let mut group = plain();
+        group.roles = Roles::Custom(CustomRoles {
+            role_ids: Map::new(vec![Id::from(3u64)]),
+        });
+        assert!(!is_plain_group(&group));
+        let mut group = plain();
+        group.aliases = List::from(vec![EmailAlias {
+            enable: true,
+            name: "team".into(),
+            domain_id: Id::from(1u64),
+            description: None,
+        }]);
+        assert!(!is_plain_group(&group));
+        #[cfg(feature = "enterprise")]
+        {
+            let mut group = plain();
+            group.member_tenant_id = Some(Id::from(2u64));
+            assert!(!is_plain_group(&group));
+            let mut group = plain();
+            group.external_id = Some("ext".into());
+            assert!(!is_plain_group(&group));
+        }
     }
 }

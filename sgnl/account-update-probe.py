@@ -13,7 +13,9 @@ for the impersonated account), so the calls run with probe's permissions, not th
 
 As the administrator it creates its own accounts: two groups, a user, and "probe", a user whose
 permissions are replaced with authenticate, sysAccountGet, sysAccountQuery and sysAccountUpdate (like an
-automated directory client). As probe it then updates the user and a group. The fork allows changes of
+automated directory client), plus sysAccountCreate. As probe it then updates the user and a group, and
+creates groups and a user: a group with the default permissions, roles and no aliases may be created; any
+other group, and a user with the default role, are refused. The fork allows changes of
 memberGroupIds and quotas only; upstream refuses all of them, because probe doesn't hold every
 permission of the user. Aliases stay refused: logins through an external directory resolve addresses by
 alias. At the end it reads the accounts back as the administrator and destroys what it
@@ -63,6 +65,14 @@ class Client:
             reason = result.get("notCreated", {}).get("new", {})
             raise SystemExit(f"setup: could not create {obj}: {reason.get('type')} {reason.get('description', '')}")
         return result["created"]["new"]["id"]
+
+    def try_create(self, obj, value):
+        """Returns (id, None) when created, else (None, the error type and description)."""
+        result = self.call(f"x:{obj}/set", {"create": {"new": value}})
+        if "new" in (result.get("created") or {}):
+            return result["created"]["new"]["id"], None
+        err = (result.get("notCreated") or {}).get("new", {"type": "unknown"})
+        return None, f"{err.get('type')}: {(err.get('description') or '')[:60]}".strip()
 
     def update(self, obj, oid, patch):
         """Returns None when updated, else the error (type and description)."""
@@ -124,7 +134,8 @@ def main():
         "@type": "User", "name": probe_name, "domainId": domain_id,
         **({} if impersonate else {"credentials": {"0": {"@type": "Password", "secret": probe_password}}}),
         "permissions": {"@type": "Replace", "disabledPermissions": {}, "enabledPermissions": {
-            "authenticate": True, "sysAccountGet": True, "sysAccountQuery": True, "sysAccountUpdate": True}},
+            "authenticate": True, "sysAccountGet": True, "sysAccountQuery": True, "sysAccountUpdate": True,
+            "sysAccountCreate": True}},
     })
     accounts.append(probe)
 
@@ -186,6 +197,40 @@ def main():
         case("group: change permissions", as_probe.update("Account", group_a, {
             "permissions": {"@type": "Merge", "disabledPermissions": {},
                             "enabledPermissions": {"impersonate": True}}}), False)
+
+        # Creating accounts.
+        def create(name, value, expect_allowed, refused_with=("forbidden",)):
+            oid, error = as_probe.try_create("Account", value)
+            if oid:
+                accounts.append(oid)
+            case(name, error, expect_allowed, refused_with)
+            return oid
+
+        user_role = next((r["id"] for r in admin.call("x:Role/get", {}).get("list", [])
+                          if r.get("description") == "User"), None)
+        shared = create("group: create with the defaults (description and quota allowed)", {
+            "@type": "Group", "name": f"probe-shared-{tag}", "domainId": domain_id,
+            "description": "probe", "quotas": {"maxDiskQuota": 1 << 30}}, True)
+        if shared:
+            stored = admin.get("Account", shared)
+            plain = stored.get("permissions", {}).get("@type") == "Inherit" \
+                and stored.get("roles", {}).get("@type") == "Default" and not stored.get("aliases")
+            case("group: created with inherited permissions, default roles, no aliases",
+                 None if plain else "stored differently", True)
+        create("group: create with permissions", {
+            "@type": "Group", "name": f"probe-g1-{tag}", "domainId": domain_id,
+            "permissions": {"@type": "Merge", "disabledPermissions": {}, "enabledPermissions": {}}}, False)
+        if user_role:
+            create("group: create with custom roles", {
+                "@type": "Group", "name": f"probe-g2-{tag}", "domainId": domain_id,
+                "roles": {"@type": "Custom", "roleIds": {user_role: True}}}, False)
+        else:
+            case("group: create with custom roles (no 'User' role found)", "skipped", True)
+        create("group: create with an alias", {
+            "@type": "Group", "name": f"probe-g3-{tag}", "domainId": domain_id,
+            "aliases": {"0": {"enable": True, "name": f"probe-g3-alias-{tag}", "domainId": domain_id}}}, False)
+        create("user: create with the default role", {
+            "@type": "User", "name": f"probe-u1-{tag}", "domainId": domain_id}, False)
 
         # What the server kept.
         after = admin.get("Account", user)
