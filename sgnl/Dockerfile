@@ -128,13 +128,18 @@ RUN \
     cargo chef cook --recipe-path recipe.json --zigbuild --release --target ${BUILD_TARGET} -p stalwart --no-default-features --features "sqlite postgres mysql rocks s3 redis keep azure nats enterprise"
 # Copy the source code
 COPY . .
-# Build generic version
+# Build generic version. Release profile as in Cargo.toml by default; a dev
+# build on a laptop passes --build-arg RELEASE_LTO=thin --build-arg
+# RELEASE_CODEGEN_UNITS=16 (fat LTO needs more memory than Docker Desktop has).
+ARG RELEASE_LTO=true
+ARG RELEASE_CODEGEN_UNITS=1
 RUN \
     --mount=type=secret,id=ACTIONS_RESULTS_URL,env=ACTIONS_RESULTS_URL \
     --mount=type=secret,id=ACTIONS_RUNTIME_TOKEN,env=ACTIONS_RUNTIME_TOKEN \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     source /env-cargo && \
+    CARGO_PROFILE_RELEASE_LTO=${RELEASE_LTO} CARGO_PROFILE_RELEASE_CODEGEN_UNITS=${RELEASE_CODEGEN_UNITS} \
     cargo zigbuild --release --target ${BUILD_TARGET} -p stalwart --no-default-features --features "sqlite postgres mysql rocks s3 redis keep azure nats enterprise" && \
     mv /app/target/${TARGET}/release/stalwart /app/artifact/stalwart
 
